@@ -12,6 +12,7 @@ use crate::{
 };
 use num_traits::FromPrimitive;
 use solana_program::{
+	instruction::{AccountMeta, Instruction},
     account_info::{next_account_info, AccountInfo},
     clock::Slot,
     decode_error::DecodeError,
@@ -63,6 +64,13 @@ pub fn process_instruction(
         } => {
             msg!("Instruction: Borrow");
             process_borrow(program_id, amount, amount_type, accounts)
+        }
+		LendingInstruction::FlashLoan {
+            amount,
+			execute_operation_ix_data
+        } => {
+            msg!("Instruction: Flashloan");
+            process_flashloan(program_id, amount, execute_operation_ix_data, accounts)
         }
         LendingInstruction::RepayReserveLiquidity { liquidity_amount } => {
             msg!("Instruction: Repay");
@@ -980,6 +988,123 @@ fn process_repay(
 
     Ok(())
 }
+
+#[inline(never)] // avoid stack frame limit
+fn process_flashloan(
+    program_id: &Pubkey,
+    token_amount: u64,
+	execute_operation_ix_data: Vec<u8>,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+	// check if token_amount is not zero
+    if token_amount == 0 {
+        return Err(LendingError::InvalidAmount.into());
+    }
+
+    let account_info_iter = &mut accounts.iter();
+	let destination_liquidity_info = next_account_info(account_info_iter)?;
+	let borrow_reserve_info = next_account_info(account_info_iter)?;
+	let borrow_reserve_liquidity_supply_info = next_account_info(account_info_iter)?;
+	let lending_market_info = next_account_info(account_info_iter)?;
+	let lending_market_authority_info = next_account_info(account_info_iter)?;
+	let caller_program_id = next_account_info(account_info_iter)?;
+	let token_program_id = next_account_info(account_info_iter)?;
+	
+	let lending_market = LendingMarket::unpack(&lending_market_info.data.borrow())?;
+    if lending_market_info.owner != program_id {
+        return Err(LendingError::InvalidAccountOwner.into());
+    }
+    if &lending_market.token_program_id != token_program_id.key {
+        return Err(LendingError::InvalidTokenProgram.into());
+    }
+
+	let mut borrow_reserve = Reserve::unpack(&borrow_reserve_info.data.borrow())?;
+    if borrow_reserve_info.owner != program_id {
+        return Err(LendingError::InvalidAccountOwner.into());
+    }
+
+	if &borrow_reserve.liquidity.supply_pubkey != borrow_reserve_liquidity_supply_info.key {
+        msg!("Invalid borrow reserve liquidity supply account input");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
+
+	if &borrow_reserve.liquidity.supply_pubkey == destination_liquidity_info.key {
+        msg!("Cannot use borrow reserve liquidity supply as destination account input");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
+
+	let before_amount = borrow_reserve.liquidity.available_amount;
+    
+	borrow_reserve.liquidity.borrow(token_amount)?;
+
+	let authority_signer_seeds = &[
+        lending_market_info.key.as_ref(),
+        &[lending_market.bump_seed],
+    ];
+    let lending_market_authority_pubkey =
+        Pubkey::create_program_address(authority_signer_seeds, program_id)?;
+    if lending_market_authority_info.key != &lending_market_authority_pubkey {
+        return Err(LendingError::InvalidMarketAuthority.into());
+    }
+
+	//flash borrow liquidity
+	spl_token_transfer(TokenTransferParams {
+        source: borrow_reserve_liquidity_supply_info.clone(),
+        destination: destination_liquidity_info.clone(),
+        amount: token_amount,
+        authority: lending_market_authority_info.clone(),
+        authority_signer_seeds,
+        token_program: token_program_id.clone(),
+    })?;
+
+	//call execute_operation of caller program
+	msg!("Calling the token program to transfer tokens to the escrow's initializer...");
+   
+	let execute_operation_ix = Instruction {
+		program_id: caller_program_id.key.clone(),
+		accounts: vec![
+			AccountMeta::new(program_id.clone(), false),
+			AccountMeta::new(token_program_id.key.clone(), false)
+		], //will add other accounts later
+		data: execute_operation_ix_data,
+	};
+
+	// invoke caller program's execute instruction 
+	// which approves transfer of token_amount back to the borrow_reserve_liquidity_supply 
+	// at the end of the execution
+	invoke(
+        &execute_operation_ix,
+        &[],
+    )?;
+
+	// transfer borrowed liquidity back to borrow reserve
+	let authority_signer_seeds = &[
+        lending_market_info.key.as_ref(),
+        &[lending_market.bump_seed],
+    ];
+
+    spl_token_transfer(TokenTransferParams {
+        source: caller_program_id.clone(),
+        destination: borrow_reserve_liquidity_supply_info.clone(),
+        amount: token_amount,
+		authority: lending_market_authority_info.clone(),
+        authority_signer_seeds,
+        token_program: token_program_id.clone(),
+    })?;
+
+	borrow_reserve.liquidity.repay(token_amount, Decimal::from(token_amount))?;
+
+	//check if flashloan has been returned
+	let after_amount = borrow_reserve.liquidity.available_amount;
+
+	if after_amount < before_amount {
+        msg!("Flashloan has not been returned by caller program");
+		return Err(LendingError::FlashloanHasNotBeenReturned.into());
+	}
+
+	Ok(())
+}
+
 
 #[inline(never)] // avoid stack frame limit
 fn process_liquidate(

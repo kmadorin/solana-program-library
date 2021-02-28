@@ -12,7 +12,7 @@ use solana_program::{
     pubkey::Pubkey,
     sysvar,
 };
-use std::{convert::TryInto, mem::size_of};
+use std::{convert::TryInto, mem::size_of, borrow::BorrowMut};
 
 /// Describe how the borrow input amount should be treated
 #[derive(Clone, Copy, Debug, PartialEq, FromPrimitive, ToPrimitive)]
@@ -197,6 +197,20 @@ pub enum LendingInstruction {
     ///   1. `[writable]` Reserve account.
     ///   .. `[writable]` Additional reserve accounts.
     AccrueReserveInterest,
+
+	/// Flash borrow tokens from a reserve.
+    ///   1. `[writable]` Destination liquidity token account (caller program's token account), minted by borrow reserve liquidity mint
+    ///   2. `[writable]` Borrow reserve account.
+    ///   3. `[writable]` Borrow reserve liquidity supply SPL Token account
+    ///   4 `[]` Lending market account.
+    ///   5 `[]` Derived lending market authority.
+	///   6 '[]' Caller program id
+    ///   7 '[]` Token program id
+    FlashLoan {
+        /// token amount
+        amount: u64,
+		execute_operation_ix_data: Vec<u8>
+    },
 }
 
 impl LendingInstruction {
@@ -266,6 +280,15 @@ impl LendingInstruction {
                 Self::LiquidateObligation { liquidity_amount }
             }
             8 => Self::AccrueReserveInterest,
+			9 => {
+                let (amount, execute_operation_ix_data_slice) = Self::unpack_u64(rest)?;
+                let execute_operation_ix_data = execute_operation_ix_data_slice.to_vec();
+				
+				Self::FlashLoan {
+                    amount,
+					execute_operation_ix_data,
+                }
+            }
             _ => return Err(LendingError::InstructionUnpackError.into()),
         })
     }
@@ -375,6 +398,14 @@ impl LendingInstruction {
             }
             Self::AccrueReserveInterest => {
                 buf.push(8);
+            }
+			Self::FlashLoan {
+                amount,
+				execute_operation_ix_data
+            } => {
+                buf.push(9);
+                buf.extend_from_slice(&amount.to_le_bytes());
+				buf.append(&execute_operation_ix_data);
             }
         }
         buf
@@ -611,6 +642,39 @@ pub fn borrow_reserve_liquidity(
         data: LendingInstruction::BorrowReserveLiquidity {
             amount,
             amount_type,
+        }
+        .pack(),
+    }
+}
+
+/// Creates a 'Flashloan' instruction.
+#[allow(clippy::too_many_arguments)]
+pub fn flashloan(
+    program_id: Pubkey,
+    amount: u64,
+	execute_operation_ix_data: Vec<u8>,
+    destination_liquidity_pubkey: Pubkey,
+    borrow_reserve_pubkey: Pubkey,
+    borrow_reserve_liquidity_supply_pubkey: Pubkey,
+    lending_market_pubkey: Pubkey,
+    lending_market_authority_pubkey: Pubkey,
+    caller_program_id: Pubkey,
+) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(destination_liquidity_pubkey, false),
+        AccountMeta::new(borrow_reserve_pubkey, false),
+        AccountMeta::new(borrow_reserve_liquidity_supply_pubkey, false),
+        AccountMeta::new_readonly(lending_market_pubkey, false),
+        AccountMeta::new_readonly(lending_market_authority_pubkey, false),
+        AccountMeta::new_readonly(caller_program_id, true),
+        AccountMeta::new_readonly(spl_token::id(), false),
+    ];
+    Instruction {
+        program_id,
+        accounts,
+        data: LendingInstruction::FlashLoan {
+            amount,
+			execute_operation_ix_data
         }
         .pack(),
     }

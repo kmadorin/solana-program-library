@@ -125,6 +125,10 @@ pub enum LendingError {
     /// Token burn failed
     #[error("Token burn failed")]
     TokenBurnFailed,
+
+	/// Flashloan has not been returned
+    #[error("Flashloan has not been returned")]
+    FlashloanHasNotBeenReturned,
 }
 
 impl From<LendingError> for ProgramError {
